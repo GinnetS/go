@@ -1,0 +1,20 @@
+
+services:
+  pinger:
+    build: .
+    image: pingpool:latest
+    container_name: pingpool
+    environment:
+      WORKERS: "600"        # Ajusta según tu host; 600 workers suele ir bien
+      TIMEOUT_MS: "1000"
+      COUNT: "1"
+      HOSTS_FILE: "/app/hosts.txt"
+      OUTPUT_FILE: "/app/results.csv"
+    volumes:
+      - ./hosts.txt:/app/hosts.txt:ro
+      - ./results.csv:/app/results.csv
+    cap_add:
+      - NET_RAW         # Necesario para ICMP
+    security_opt:
+      - no-new-privileges:false
+    restart: unless-stopped
