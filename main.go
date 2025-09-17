@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"encoding/csv"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -20,7 +19,7 @@ import (
 )
 
 type PingResult struct {
-	Host string
+	Host  string
 	Alive bool
 	RTT   time.Duration
 	Err   string
@@ -34,21 +33,26 @@ func getenvInt(key string, def int) int {
 	}
 	return def
 }
-
 func getenvStr(key, def string) string {
-	if v := os.Getenv(key); v != "" { return v }
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
 	return def
 }
 
 func readHosts(path string) ([]string, error) {
 	f, err := os.Open(path)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer f.Close()
 	s := bufio.NewScanner(f)
 	var hosts []string
 	for s.Scan() {
 		line := strings.TrimSpace(s.Text())
-		if line == "" || strings.HasPrefix(line, "#") { continue }
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
 		hosts = append(hosts, line)
 	}
 	return hosts, s.Err()
@@ -56,9 +60,8 @@ func readHosts(path string) ([]string, error) {
 
 var seq uint32
 
-// NUEVO: pingOnceWithConn usa un socket compartido por worker
+// un intento ICMP usando un socket compartido por worker
 func pingOnceWithConn(conn *icmp.PacketConn, dst *net.IPAddr, timeout time.Duration, id, seq int) (time.Duration, error) {
-	// Establece deadline de lectura/escritura por intento
 	_ = conn.SetDeadline(time.Now().Add(timeout))
 
 	msg := icmp.Message{
@@ -84,7 +87,7 @@ func pingOnceWithConn(conn *icmp.PacketConn, dst *net.IPAddr, timeout time.Durat
 		}
 		rtt := time.Since(start)
 
-		// Validar que la respuesta provenga del destino esperado
+		// valida origen de la respuesta
 		peerIP := ""
 		switch p := peer.(type) {
 		case *net.IPAddr:
@@ -93,11 +96,10 @@ func pingOnceWithConn(conn *icmp.PacketConn, dst *net.IPAddr, timeout time.Durat
 			peerIP = peer.String()
 		}
 		if !net.IP.Equal(dst.IP, net.ParseIP(strings.Split(peerIP, "%")[0])) {
-			// Respuesta de otro host; seguir leyendo hasta timeout
-			continue
+			continue // otra respuesta, seguimos hasta deadline
 		}
 
-		rec, err := icmp.ParseMessage(1, buf[:n])
+		rec, err := icmp.ParseMessage(1, buf[:n]) // 1 = ICMPv4
 		if err != nil {
 			return 0, fmt.Errorf("parse: %w", err)
 		}
@@ -106,15 +108,13 @@ func pingOnceWithConn(conn *icmp.PacketConn, dst *net.IPAddr, timeout time.Durat
 				return rtt, nil
 			}
 		}
-		// Si no es el paquete esperado, seguir en loop hasta timeout (por deadline)
 	}
 }
 
 func worker(id int, jobs <-chan string, results chan<- PingResult, count int, timeout time.Duration) {
-	// Cada worker mantiene UN socket ICMP (menos FDs, más estable)
+	// un socket por worker (estable y eficiente en FD)
 	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
-		// Sin NET_RAW o permisos -> todos los pings fallarán en este worker
 		for host := range jobs {
 			results <- PingResult{Host: host, Alive: false, Err: fmt.Sprintf("icmp listen: %v", err)}
 		}
@@ -148,62 +148,13 @@ func worker(id int, jobs <-chan string, results chan<- PingResult, count int, ti
 	}
 }
 
-func pingHost(host string, count int, timeout time.Duration, id int) PingResult {
-	var lastErr error
-	for i := 0; i < count; i++ {
-		rtt, err := pingOnce(host, timeout, id)
-		if err == nil {
-			return PingResult{Host: host, Alive: true, RTT: rtt}
-		}
-		lastErr = err
-	}
-	return PingResult{Host: host, Alive: false, RTT: 0, Err: lastErr.Error()}
-}
-
-func worker(id int, jobs <-chan string, results chan<- PingResult, count int, timeout time.Duration) {
-	// Cada worker mantiene UN socket ICMP (menos FDs, más estable)
-	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
-	if err != nil {
-		// Sin NET_RAW o permisos -> todos los pings fallarán en este worker
-		for host := range jobs {
-			results <- PingResult{Host: host, Alive: false, Err: fmt.Sprintf("icmp listen: %v", err)}
-		}
-		return
-	}
-	defer conn.Close()
-
-	for host := range jobs {
-		ipAddr, rerr := net.ResolveIPAddr("ip4", host)
-		if rerr != nil {
-			results <- PingResult{Host: host, Alive: false, Err: fmt.Sprintf("resolve: %v", rerr)}
-			continue
-		}
-		var lastErr error
-		var rtt time.Duration
-		ok := false
-		for i := 0; i < count; i++ {
-			seqNum := int(atomic.AddUint32(&seq, 1))
-			rtt, lastErr = pingOnceWithConn(conn, ipAddr, timeout, id, seqNum)
-			if lastErr == nil {
-				ok = true
-				break
-			}
-		}
-		results <- PingResult{
-			Host:  host,
-			Alive: ok,
-			RTT:   rtt,
-			Err:   func() string { if lastErr != nil { return lastErr.Error() }; return "" }(),
-		}
-	}
-}
 func main() {
-	// Flags (puedes sobreescribir con envs)
-	defWorkers := getenvInt("WORKERS", 300)
-	defTimeout := getenvInt("TIMEOUT_MS", 1000)
-	defCount := getenvInt("COUNT", 1)
-	hostsFile := getenvStr("HOSTS_FILE", "hosts.txt")
-	outputFile := getenvStr("OUTPUT_FILE", "results.csv")
+	// valores por env (override con flags)
+	defWorkers := getenvInt("WORKERS", 600)      // p. ej. 600 workers para 3000 hosts
+	defTimeout := getenvInt("TIMEOUT_MS", 1000)  // 1s
+	defCount := getenvInt("COUNT", 1)            // 1 intento
+	hostsFile := getenvStr("HOSTS_FILE", "/data/hosts.txt")
+	outputFile := getenvStr("OUTPUT_FILE", "/out/results.csv")
 
 	workers := flag.Int("workers", defWorkers, "cantidad de workers")
 	timeoutMs := flag.Int("timeout", defTimeout, "timeout por ping (ms)")
@@ -211,10 +162,14 @@ func main() {
 	flag.Parse()
 
 	hosts, err := readHosts(hostsFile)
-	if err != nil { log.Fatalf("error leyendo hosts: %v", err) }
-	if len(hosts) == 0 { log.Fatalf("%s no tiene hosts", hostsFile) }
+	if err != nil {
+		log.Fatalf("error leyendo hosts: %v", err)
+	}
+	if len(hosts) == 0 {
+		log.Fatalf("%s no tiene hosts", hostsFile)
+	}
 
-	log.Printf("Iniciando ping a %d hosts con %d workers (timeout=%dms, count=%d)\n", len(hosts), *workers, *timeoutMs, *count)
+	log.Printf("Ping a %d hosts con %d workers (timeout=%dms, count=%d)\n", len(hosts), *workers, *timeoutMs, *count)
 
 	jobs := make(chan string)
 	results := make(chan PingResult)
@@ -229,36 +184,47 @@ func main() {
 		}()
 	}
 
-	// Collector
+	// recolector
 	var collectorWg sync.WaitGroup
 	collectorWg.Add(1)
 
-	aliveCount := int64(0)
-	go func() {
+	var aliveCount int64
+	go func(total int) {
 		defer collectorWg.Done()
+		if err := os.MkdirAll("/out", 0o755); err != nil {
+			log.Fatalf("no se pudo crear /out: %v", err)
+		}
 		f, err := os.Create(outputFile)
-		if err != nil { log.Fatalf("no se pudo crear %s: %v", outputFile, err) }
+		if err != nil {
+			log.Fatalf("no se pudo crear %s: %v", outputFile, err)
+		}
 		defer f.Close()
 		w := csv.NewWriter(f)
 		defer w.Flush()
 		_ = w.Write([]string{"host", "alive", "rtt_ms", "error"})
-		for i := 0; i < len(hosts); i++ {
+		for i := 0; i < total; i++ {
 			res := <-results
-			if res.Alive { atomic.AddInt64(&aliveCount, 1) }
+			if res.Alive {
+				atomic.AddInt64(&aliveCount, 1)
+			}
 			rttMs := ""
-			if res.RTT > 0 { rttMs = fmt.Sprintf("%.2f", float64(res.RTT.Microseconds())/1000.0) }
+			if res.RTT > 0 {
+				rttMs = fmt.Sprintf("%.2f", float64(res.RTT.Microseconds())/1000.0)
+			}
 			_ = w.Write([]string{res.Host, strconv.FormatBool(res.Alive), rttMs, res.Err})
 			log.Printf("%s -> alive=%v rtt=%s err=%s", res.Host, res.Alive, rttMs, res.Err)
 		}
-	}()
+	}(len(hosts))
 
-	// Enqueue
+	// enqueue
 	go func() {
-		for _, h := range hosts { jobs <- h }
+		for _, h := range hosts {
+			jobs <- h
+		}
 		close(jobs)
 	}()
 
-	// Esperar workers
+	// cerrar results cuando terminen los workers
 	go func() {
 		wg.Wait()
 		close(results)
